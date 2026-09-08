@@ -4,36 +4,25 @@
   "dependencies": [
     "catch2",
     "cjson",
-    {
-      "name": "curl",
-      "features": [
-        "ssl"
-      ]
-    },
+    { "name": "curl", "features": ["ssl"] },
     "glslang",
     "cli11",
     "stb",
     "mimalloc",
     "zstd",
     "sdl3",
+    "openal-soft",
     "opus",
     "libogg",
     "libvorbis",
     "enkits",
     {
       "name": "imgui",
-      "features": [
-        "sdl3-binding",
-        "sdl3-renderer-binding",
-        "opengl3-binding",
-        "freetype"
-      ]
+      "features": ["sdl3-binding", "sdl3-renderer-binding", "opengl3-binding", "freetype"]
     },
     {
       "name": "spdlog",
-      "features": [
-        "wchar"
-      ],
+      "features": ["wchar"],
       "platform": "windows"
     },
     {

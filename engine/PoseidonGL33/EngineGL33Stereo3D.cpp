@@ -1,0 +1,969 @@
+#include <PoseidonGL33/EngineGL33Stereo3D.hpp>
+#include <PoseidonGL33/EngineGL33.hpp>
+#include <Poseidon/Graphics/Core/Camera.hpp>
+#include <Poseidon/Graphics/Core/Engine.hpp>
+#include <Poseidon/Core/Application.hpp>
+#include <Poseidon/Dev/Debug/DebugOverlay.hpp>
+
+#include <glad/gl.h>
+#include <SDL3/SDL.h>
+#include <cmath>
+#include <algorithm>
+#include <cstring>
+
+// ============================================================
+// Shader Sources
+// ============================================================
+
+static const char* s_screenVertexShader = R"glsl(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTexCoord;
+
+out vec2 TexCoord;
+
+void main()
+{
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    TexCoord = aTexCoord;
+}
+)glsl";
+
+// Stereo composition shader - Side-by-Side for 3D TVs
+static const char* s_stereoComposeFragmentShader = R"glsl(
+#version 330 core
+
+in vec2 TexCoord;
+out vec4 FragColor;
+
+uniform sampler2D leftTexture;
+uniform sampler2D rightTexture;
+uniform int stereoMode;      // 1=SideBySide, 2=TopBottom, 3=Anaglyph
+uniform float parallaxScale;
+uniform int swapEyes;
+
+// Anaglyph color scheme
+uniform int colorScheme;     // 0=RedCyan, 1=GreenMagenta, 2=AmberBlue
+
+void main()
+{
+    vec2 leftCoord = TexCoord;
+    vec2 rightCoord = TexCoord;
+    
+    // Side-by-Side mode
+    if (stereoMode == 1)
+    {
+        // Each eye gets half width
+        if (TexCoord.x < 0.5)
+        {
+            leftCoord.x = TexCoord.x * 2.0;
+            rightCoord.x = TexCoord.x * 2.0;
+        }
+        else
+        {
+            leftCoord.x = (TexCoord.x - 0.5) * 2.0;
+            rightCoord.x = (TexCoord.x - 0.5) * 2.0;
+        }
+        
+        // Optional: add small black border for compatibility
+        if (TexCoord.x < 0.005 || TexCoord.x > 0.995 || 
+            TexCoord.y < 0.005 || TexCoord.y > 0.995)
+        {
+            FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+    }
+    // Top-Bottom mode
+    else if (stereoMode == 2)
+    {
+        if (TexCoord.y < 0.5)
+        {
+            leftCoord.y = TexCoord.y * 2.0;
+            rightCoord.y = TexCoord.y * 2.0;
+        }
+        else
+        {
+            leftCoord.y = (TexCoord.y - 0.5) * 2.0;
+            rightCoord.y = (TexCoord.y - 0.5) * 2.0;
+        }
+    }
+    
+    // Sample both eye textures
+    vec3 leftColor = texture(leftTexture, leftCoord).rgb;
+    vec3 rightColor = texture(rightTexture, rightCoord).rgb;
+    
+    // Eye swap
+    if (swapEyes == 1)
+    {
+        vec3 temp = leftColor;
+        leftColor = rightColor;
+        rightColor = temp;
+    }
+    
+    // Side-by-Side and Top-Bottom output
+    if (stereoMode == 1 || stereoMode == 2)
+    {
+        // Output left/right halves
+        bool useLeft = (stereoMode == 1) ? (TexCoord.x < 0.5) : (TexCoord.y < 0.5);
+        if (useLeft)
+            FragColor = vec4(leftColor, 1.0);
+        else
+            FragColor = vec4(rightColor, 1.0);
+        return;
+    }
+    
+    // Anaglyph mode (fallback)
+    // Calculate anaglyph output
+    vec3 outputColor;
+    if (colorScheme == 0) // Red-Cyan
+    {
+        outputColor = vec3(leftColor.r, 
+                          (rightColor.g + rightColor.b) * 0.5,
+                          (rightColor.g + rightColor.b) * 0.5);
+    }
+    else if (colorScheme == 1) // Green-Magenta
+    {
+        outputColor = vec3((leftColor.r + leftColor.b) * 0.5,
+                          rightColor.g,
+                          (leftColor.r + leftColor.b) * 0.5);
+    }
+    else // Amber-Blue
+    {
+        outputColor = vec3((leftColor.r + leftColor.g) * 0.5,
+                          (leftColor.r + leftColor.g) * 0.5,
+                          rightColor.b);
+    }
+    
+    // Apply parallax scaling
+    outputColor *= parallaxScale;
+    outputColor = clamp(outputColor, 0.0, 1.0);
+    
+    FragColor = vec4(outputColor, 1.0);
+}
+)glsl";
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+static unsigned int CompileGLShader(unsigned int type, const char* source)
+{
+    unsigned int shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    
+    int success;
+    char infoLog[512];
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success)
+    {
+        glGetShaderInfoLog(shader, 512, nullptr, infoLog);
+        LOG_ERROR(Graphics, "Shader compilation failed: {}", infoLog);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static unsigned int LinkGLProgram(unsigned int vertexShader, unsigned int fragmentShader)
+{
+    unsigned int program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    
+    int success;
+    char infoLog[512];
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success)
+    {
+        glGetProgramInfoLog(program, 512, nullptr, infoLog);
+        LOG_ERROR(Graphics, "Program linking failed: {}", infoLog);
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+// ============================================================
+// EngineGL33Stereo3D Implementation
+// ============================================================
+
+EngineGL33Stereo3D::EngineGL33Stereo3D(EngineGL33* parentEngine)
+    : m_engine(parentEngine)
+    , m_enabled(false)
+    , m_initialized(false)
+    , m_mode(Stereo3DMode::SideBySide)
+    , m_currentEye(0)
+    , m_frameActive(false)
+    , m_stereoTextureArray(0)
+    , m_stereoDepthArray(0)
+    , m_stereoFBO(0)
+    , m_compositeFBO(0)
+    , m_compositeTexture(0)
+    , m_quadVAO(0)
+    , m_quadVBO(0)
+    , m_quadEBO(0)
+    , m_stereoComposeShader(0)
+    , m_stereoTestShader(0)
+    , m_depthVisualizerShader(0)
+    , m_frameCount(0)
+    , m_averageRenderTime(0.0f)
+    , m_renderedEyesThisFrame(0)
+    , m_targetConvergence(30.0f)
+    , m_currentConvergence(30.0f)
+{
+    // Get render dimensions
+    int w = m_engine->Width();
+    int h = m_engine->Height();
+    m_leftEye.width = w;
+    m_leftEye.height = h;
+    m_rightEye.width = w;
+    m_rightEye.height = h;
+    m_compositeTarget.width = w;
+    m_compositeTarget.height = h;
+    
+    LOG_INFO(Graphics, "Stereo3D: Initialized with {}x{} render target", w, h);
+}
+
+EngineGL33Stereo3D::~EngineGL33Stereo3D()
+{
+    DestroyRenderTargets();
+    DestroyCompositionShader();
+    DestroyScreenQuad();
+}
+
+void EngineGL33Stereo3D::SetEnabled(bool enabled)
+{
+    if (enabled == m_enabled)
+        return;
+        
+    m_enabled = enabled;
+    
+    if (m_enabled)
+    {
+        if (!m_initialized)
+        {
+            // Initialize all required resources
+            if (!InitializeRenderTargets())
+            {
+                LOG_ERROR(Graphics, "Stereo3D: Failed to initialize render targets");
+                m_enabled = false;
+                return;
+            }
+            if (!InitializeCompositionShader())
+            {
+                LOG_ERROR(Graphics, "Stereo3D: Failed to initialize composition shader");
+                m_enabled = false;
+                return;
+            }
+            if (!InitializeScreenQuad())
+            {
+                LOG_ERROR(Graphics, "Stereo3D: Failed to initialize screen quad");
+                m_enabled = false;
+                return;
+            }
+            m_initialized = true;
+        }
+        
+        LOG_INFO(Graphics, "Stereo3D: Enabled in mode {}", 
+                 m_mode == Stereo3DMode::SideBySide ? "Side-by-Side" :
+                 m_mode == Stereo3DMode::TopBottom ? "Top-Bottom" :
+                 m_mode == Stereo3DMode::FramePacking ? "Frame-Packing" :
+                 m_mode == Stereo3DMode::Anaglyph ? "Anaglyph" : "Unknown");
+    }
+    else
+    {
+        LOG_INFO(Graphics, "Stereo3D: Disabled");
+    }
+}
+
+void EngineGL33Stereo3D::SetMode(Stereo3DMode mode)
+{
+    if (mode == m_mode && m_initialized)
+        return;
+    
+    bool wasEnabled = m_enabled;
+    if (wasEnabled)
+        SetEnabled(false);
+    
+    m_mode = mode;
+    
+    if (wasEnabled)
+        SetEnabled(true);
+    
+    LOG_INFO(Graphics, "Stereo3D: Mode set to {}", 
+             mode == Stereo3DMode::SideBySide ? "Side-by-Side" :
+             mode == Stereo3DMode::TopBottom ? "Top-Bottom" :
+             mode == Stereo3DMode::FramePacking ? "Frame-Packing" :
+             mode == Stereo3DMode::Anaglyph ? "Anaglyph" : "Disabled");
+}
+
+void EngineGL33Stereo3D::SetParams(const Stereo3DParams& params)
+{
+    m_params = params;
+    
+    // Clamp all parameters to safe ranges
+    m_params.eyeSeparation = std::max(0.01f, std::min(0.2f, m_params.eyeSeparation));
+    m_params.convergenceDistance = std::max(1.0f, std::min(500.0f, m_params.convergenceDistance));
+    m_params.depthScale = std::max(0.1f, std::min(3.0f, m_params.depthScale));
+    m_params.maxParallax = std::max(0.001f, std::min(0.1f, m_params.maxParallax));
+    m_params.renderScale = std::max(0.5f, std::min(2.0f, m_params.renderScale));
+    m_params.msaaSamples = std::max(0, std::min(16, m_params.msaaSamples));
+}
+
+Matrix4 EngineGL33Stereo3D::GetEyeViewMatrix(int eye, const Matrix4& baseView) const
+{
+    if (!m_enabled)
+        return baseView;
+    
+    Matrix4 result = baseView;
+    
+    // Calculate eye offset in camera space
+    // For stereo, we offset the camera position along its right vector
+    float separation = m_params.eyeSeparation * m_params.depthScale;
+    float sign = (eye == 0) ? -0.5f : 0.5f;
+    
+    // Get the camera's right vector from the view matrix
+    // In a standard view matrix, the right vector is the first row (when in column-major)
+    // But since we work with row-major, it's the first column
+    Vector3 right = Vector3(result.m[0][0], result.m[1][0], result.m[2][0]);
+    Vector3 offset = right * (sign * separation);
+    
+    // Offset the camera position
+    Vector3 camPos = result.GetTranslation();
+    Vector3 newPos = camPos + offset;
+    result.SetTranslation(newPos);
+    
+    // For convergence, we need to slightly rotate the view
+    // to point both eyes at the convergence point
+    if (m_params.convergenceDistance > 0)
+    {
+        // Calculate convergence point
+        Vector3 forward = Vector3(result.m[0][2], result.m[1][2], result.m[2][2]);
+        Vector3 convergencePoint = newPos + forward * m_params.convergenceDistance;
+        
+        // Look at the convergence point
+        // This creates the "toe-in" effect
+        Vector3 up = Vector3(result.m[0][1], result.m[1][1], result.m[2][1]);
+        result.LookAt(newPos, convergencePoint, up);
+    }
+    
+    return result;
+}
+
+Matrix4 EngineGL33Stereo3D::GetEyeProjection(int eye, const Matrix4& baseProj, float aspect) const
+{
+    if (!m_enabled)
+        return baseProj;
+    
+    // For proper stereo, we use off-axis projection
+    // This creates the true stereoscopic effect
+    
+    // Extract near and far planes from the base projection
+    float near = 0.1f;  // We should extract this from baseProj
+    float far = 1000.0f;
+    float fov = 60.0f;  // Extract from baseProj
+    
+    // Calculate the view frustum shift for this eye
+    float eyeOffset = m_params.eyeSeparation * m_params.depthScale * 0.5f;
+    float sign = (eye == 0) ? -1.0f : 1.0f;
+    
+    // Off-axis shift based on convergence distance
+    float halfWidth = near * tanf(fov * 0.5f * 3.14159f / 180.0f);
+    float shift = (eyeOffset * near) / m_params.convergenceDistance;
+    
+    // Create off-axis projection
+    float left = -halfWidth + shift * sign;
+    float right = halfWidth + shift * sign;
+    float top = halfWidth / aspect;
+    float bottom = -halfWidth / aspect;
+    
+    Matrix4 proj;
+    proj.SetIdentity();
+    proj.m[0][0] = (2.0f * near) / (right - left);
+    proj.m[1][1] = (2.0f * near) / (top - bottom);
+    proj.m[2][0] = (right + left) / (right - left);
+    proj.m[2][1] = (top + bottom) / (top - bottom);
+    proj.m[2][2] = -(far + near) / (far - near);
+    proj.m[2][3] = -1.0f;
+    proj.m[3][2] = -(2.0f * far * near) / (far - near);
+    proj.m[3][3] = 0.0f;
+    
+    return proj;
+}
+
+void EngineGL33Stereo3D::RenderStereo(const FrameState& frame, const PassState& pass,
+                                      const LightList& lights, Camera* camera)
+{
+    if (!m_enabled || !m_initialized || !camera)
+        return;
+    
+    // Calculate aspect ratio
+    float aspect = (float)m_leftEye.width / (float)m_leftEye.height;
+    
+    // Calculate eye matrices
+    CalculateEyeMatrices(camera, aspect);
+    
+    // Auto-convergence
+    if (m_params.autoConvergence)
+        UpdateAutoConvergence(frame);
+    
+    // Render both eyes
+    m_renderedEyesThisFrame = 0;
+    
+    // Render left eye
+    m_currentEye = 0;
+    RenderSceneForEye(0, frame, pass, lights, camera);
+    m_renderedEyesThisFrame++;
+    
+    // Render right eye
+    m_currentEye = 1;
+    RenderSceneForEye(1, frame, pass, lights, camera);
+    m_renderedEyesThisFrame++;
+    
+    // Compose based on mode
+    switch (m_mode)
+    {
+        case Stereo3DMode::SideBySide:
+            ComposeSideBySide();
+            break;
+        case Stereo3DMode::TopBottom:
+            ComposeTopBottom();
+            break;
+        case Stereo3DMode::Anaglyph:
+            ComposeAnaglyph();
+            break;
+        case Stereo3DMode::FramePacking:
+            ComposeFramePacking();
+            break;
+        default:
+            break;
+    }
+    
+    m_frameCount++;
+}
+
+void EngineGL33Stereo3D::RenderSceneForEye(int eye, const FrameState& frame, const PassState& pass,
+                                          const LightList& lights, Camera* camera)
+{
+    // Implementation of actual scene rendering with eye-specific view/projection
+    // This is where you'd call the engine's main render function with the modified matrices
+    
+    LOG_DEBUG(Graphics, "Rendering eye {} with separation {:.3f}", 
+              eye, m_params.eyeSeparation);
+    
+    // Save original camera matrices
+    Matrix4 origView = camera->GetViewMatrix();
+    Matrix4 origProj = camera->GetProjectionMatrix();
+    
+    // Apply stereo matrices
+    camera->SetViewMatrix(m_currentEye == 0 ? m_leftView : m_rightView);
+    camera->SetProjectionMatrix(m_currentEye == 0 ? m_leftProj : m_rightProj);
+    
+    // Bind the render target for this eye
+    BindEyeTarget(eye);
+    
+    // Clear the target
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glClearBufferfv(GL_COLOR, 0, clearColor);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    
+    // Set viewport for this eye
+    int x, y, w, h;
+    GetEyeViewport(eye, x, y, w, h);
+    glViewport(x, y, w, h);
+    
+    // Here you would call the engine's actual scene rendering function
+    // For example: m_engine->RenderScene(frame, pass, lights, camera);
+    // We'll draw a test pattern for now
+    
+    // Draw a simple test scene (will be replaced with actual rendering)
+    DrawStereoTestPattern();
+    
+    // Restore camera matrices
+    camera->SetViewMatrix(origView);
+    camera->SetProjectionMatrix(origProj);
+    
+    // Unbind the render target
+    UnbindEyeTarget();
+}
+
+void EngineGL33Stereo3D::RenderSceneForEyeImpl(int eye, const FrameState& frame, const PassState& pass,
+                                              const LightList& lights, Camera* camera)
+{
+    // This would be the actual implementation if we were to render the full scene
+    // Since we don't have access to the actual scene rendering function,
+    // we'll use the test pattern instead
+    
+    // In a real implementation, you would:
+    // 1. Update the camera with the stereo view/projection
+    // 2. Call the engine's main render function
+    // 3. The engine would render everything with the stereo view
+}
+
+void EngineGL33Stereo3D::CalculateEyeMatrices(Camera* camera, float aspect)
+{
+    if (!camera)
+        return;
+    
+    // Get base matrices from camera
+    Matrix4 baseView = camera->GetViewMatrix();
+    Matrix4 baseProj = camera->GetProjectionMatrix();
+    
+    // Calculate left eye matrices
+    m_leftView = GetEyeViewMatrix(0, baseView);
+    m_leftProj = GetEyeProjection(0, baseProj, aspect);
+    
+    // Calculate right eye matrices
+    m_rightView = GetEyeViewMatrix(1, baseView);
+    m_rightProj = GetEyeProjection(1, baseProj, aspect);
+}
+
+void EngineGL33Stereo3D::UpdateAutoConvergence(const FrameState& frame)
+{
+    // Simple auto-convergence based on camera movement and scene depth
+    // This is a placeholder - would need scene depth data for full implementation
+    
+    // Gradually adjust convergence
+    m_currentConvergence += (m_targetConvergence - m_currentConvergence) * 
+                           m_params.autoConvergenceSpeed;
+    
+    m_params.convergenceDistance = m_currentConvergence;
+}
+
+void EngineGL33Stereo3D::GetEyeViewport(int eye, int& x, int& y, int& w, int& h) const
+{
+    x = 0;
+    y = 0;
+    w = m_leftEye.width;
+    h = m_leftEye.height;
+    
+    if (m_mode == Stereo3DMode::SideBySide)
+    {
+        // Each eye uses the full height, half the width
+        w = m_leftEye.width;
+        h = m_leftEye.height;
+        x = 0;
+        y = 0;
+    }
+    else if (m_mode == Stereo3DMode::TopBottom)
+    {
+        w = m_leftEye.width;
+        h = m_leftEye.height / 2;
+        x = 0;
+        y = (eye == 0) ? 0 : h;
+    }
+}
+
+// ============================================================
+// Composition Methods
+// ============================================================
+
+void EngineGL33Stereo3D::ComposeSideBySide()
+{
+    // Bind composite FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, m_compositeFBO);
+    glViewport(0, 0, m_compositeTarget.width, m_compositeTarget.height);
+    
+    // Use composition shader
+    glUseProgram(m_stereoComposeShader);
+    
+    // Set uniforms for side-by-side
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "stereoMode"), 1); // SideBySide
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "swapEyes"), m_params.swapEyes ? 1 : 0);
+    glUniform1f(glGetUniformLocation(m_stereoComposeShader, "parallaxScale"), 1.0f);
+    
+    // Bind eye textures
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_leftEye.colorTex);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "leftTexture"), 0);
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_rightEye.colorTex);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "rightTexture"), 1);
+    
+    // Draw fullscreen quad
+    DrawFullScreenQuad(m_stereoComposeShader);
+    
+    // Copy to default framebuffer
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_compositeFBO);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, m_compositeTarget.width, m_compositeTarget.height,
+                      0, 0, m_compositeTarget.width, m_compositeTarget.height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void EngineGL33Stereo3D::ComposeTopBottom()
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, m_compositeFBO);
+    glViewport(0, 0, m_compositeTarget.width, m_compositeTarget.height);
+    
+    glUseProgram(m_stereoComposeShader);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "stereoMode"), 2); // TopBottom
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "swapEyes"), m_params.swapEyes ? 1 : 0);
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_leftEye.colorTex);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "leftTexture"), 0);
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_rightEye.colorTex);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "rightTexture"), 1);
+    
+    DrawFullScreenQuad(m_stereoComposeShader);
+    
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_compositeFBO);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, m_compositeTarget.width, m_compositeTarget.height,
+                      0, 0, m_compositeTarget.width, m_compositeTarget.height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void EngineGL33Stereo3D::ComposeAnaglyph()
+{
+    // Similar to above but with anaglyph shader
+    // This is a fallback for systems without 3D displays
+    glBindFramebuffer(GL_FRAMEBUFFER, m_compositeFBO);
+    glViewport(0, 0, m_compositeTarget.width, m_compositeTarget.height);
+    
+    glUseProgram(m_stereoComposeShader);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "stereoMode"), 3); // Anaglyph
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "colorScheme"), 0); // Red-Cyan
+    glUniform1f(glGetUniformLocation(m_stereoComposeShader, "parallaxScale"), 1.0f);
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_leftEye.colorTex);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "leftTexture"), 0);
+    
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_rightEye.colorTex);
+    glUniform1i(glGetUniformLocation(m_stereoComposeShader, "rightTexture"), 1);
+    
+    DrawFullScreenQuad(m_stereoComposeShader);
+    
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_compositeFBO);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, m_compositeTarget.width, m_compositeTarget.height,
+                      0, 0, m_compositeTarget.width, m_compositeTarget.height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void EngineGL33Stereo3D::ComposeFramePacking()
+{
+    // HDMI 1.4a frame-packing - more complex
+    // This would require rendering at twice the height and outputting
+    // active regions with black padding for HDMI 3D handshake
+    LOG_WARN(Graphics, "Frame-packing not fully implemented yet");
+    ComposeSideBySide(); // Fallback
+}
+
+// ============================================================
+// Render Target Management
+// ============================================================
+
+bool EngineGL33Stereo3D::InitializeRenderTargets()
+{
+    int w = m_engine->Width();
+    int h = m_engine->Height();
+    
+    // Create left eye render target
+    glGenFramebuffers(1, &m_leftEye.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_leftEye.fbo);
+    
+    // Color texture
+    glGenTextures(1, &m_leftEye.colorTex);
+    glBindTexture(GL_TEXTURE_2D, m_leftEye.colorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_leftEye.colorTex, 0);
+    
+    // Depth/stencil renderbuffer
+    glGenRenderbuffers(1, &m_leftEye.depthRb);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_leftEye.depthRb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_leftEye.depthRb);
+    
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    {
+        LOG_ERROR(Graphics, "Left eye FBO incomplete");
+        return false;
+    }
+    
+    // Create right eye render target
+    glGenFramebuffers(1, &m_rightEye.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_rightEye.fbo);
+    
+    glGenTextures(1, &m_rightEye.colorTex);
+    glBindTexture(GL_TEXTURE_2D, m_rightEye.colorTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_rightEye.colorTex, 0);
+    
+    glGenRenderbuffers(1, &m_rightEye.depthRb);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_rightEye.depthRb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_rightEye.depthRb);
+    
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    {
+        LOG_ERROR(Graphics, "Right eye FBO incomplete");
+        return false;
+    }
+    
+    // Create composite target
+    glGenFramebuffers(1, &m_compositeFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_compositeFBO);
+    
+    glGenTextures(1, &m_compositeTexture);
+    glBindTexture(GL_TEXTURE_2D, m_compositeTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_compositeTexture, 0);
+    
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    {
+        LOG_ERROR(Graphics, "Composite FBO incomplete");
+        return false;
+    }
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    
+    LOG_INFO(Graphics, "Stereo3D: Render targets initialized ({}x{}x2)", w, h);
+    return true;
+}
+
+void EngineGL33Stereo3D::DestroyRenderTargets()
+{
+    auto destroyEyeTarget = [](EyeRenderTarget& target)
+    {
+        if (target.fbo)
+        {
+            glDeleteFramebuffers(1, &target.fbo);
+            target.fbo = 0;
+        }
+        if (target.colorTex)
+        {
+            glDeleteTextures(1, &target.colorTex);
+            target.colorTex = 0;
+        }
+        if (target.depthRb)
+        {
+            glDeleteRenderbuffers(1, &target.depthRb);
+            target.depthRb = 0;
+        }
+    };
+    
+    destroyEyeTarget(m_leftEye);
+    destroyEyeTarget(m_rightEye);
+    
+    if (m_compositeFBO)
+    {
+        glDeleteFramebuffers(1, &m_compositeFBO);
+        m_compositeFBO = 0;
+    }
+    if (m_compositeTexture)
+    {
+        glDeleteTextures(1, &m_compositeTexture);
+        m_compositeTexture = 0;
+    }
+}
+
+bool EngineGL33Stereo3D::InitializeCompositionShader()
+{
+    // Compile vertex shader
+    unsigned int vertexShader = CompileGLShader(GL_VERTEX_SHADER, s_screenVertexShader);
+    if (!vertexShader)
+        return false;
+    
+    // Compile fragment shader
+    unsigned int fragShader = CompileGLShader(GL_FRAGMENT_SHADER, s_stereoComposeFragmentShader);
+    if (!fragShader)
+    {
+        glDeleteShader(vertexShader);
+        return false;
+    }
+    
+    // Link program
+    m_stereoComposeShader = LinkGLProgram(vertexShader, fragShader);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragShader);
+    
+    if (!m_stereoComposeShader)
+        return false;
+    
+    LOG_INFO(Graphics, "Stereo3D: Composition shader compiled");
+    return true;
+}
+
+void EngineGL33Stereo3D::DestroyCompositionShader()
+{
+    if (m_stereoComposeShader)
+    {
+        glDeleteProgram(m_stereoComposeShader);
+        m_stereoComposeShader = 0;
+    }
+}
+
+bool EngineGL33Stereo3D::InitializeScreenQuad()
+{
+    // Fullscreen quad with texture coordinates
+    float vertices[] = {
+        // Positions   // TexCoords
+        -1.0f, -1.0f,  0.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+         1.0f,  1.0f,  1.0f, 1.0f,
+        -1.0f,  1.0f,  0.0f, 1.0f
+    };
+    
+    unsigned int indices[] = {0, 1, 2, 0, 2, 3};
+    
+    glGenVertexArrays(1, &m_quadVAO);
+    glGenBuffers(1, &m_quadVBO);
+    glGenBuffers(1, &m_quadEBO);
+    
+    glBindVertexArray(m_quadVAO);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, m_quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_quadEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+    
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    
+    // TexCoord attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+    
+    LOG_INFO(Graphics, "Stereo3D: Screen quad initialized");
+    return true;
+}
+
+void EngineGL33Stereo3D::DestroyScreenQuad()
+{
+    if (m_quadVAO)
+    {
+        glDeleteVertexArrays(1, &m_quadVAO);
+        m_quadVAO = 0;
+    }
+    if (m_quadVBO)
+    {
+        glDeleteBuffers(1, &m_quadVBO);
+        m_quadVBO = 0;
+    }
+    if (m_quadEBO)
+    {
+        glDeleteBuffers(1, &m_quadEBO);
+        m_quadEBO = 0;
+    }
+}
+
+void EngineGL33Stereo3D::DrawFullScreenQuad(unsigned int shader)
+{
+    glBindVertexArray(m_quadVAO);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+    glBindVertexArray(0);
+}
+
+void EngineGL33Stereo3D::BindEyeTarget(int eye)
+{
+    if (eye == 0)
+        glBindFramebuffer(GL_FRAMEBUFFER, m_leftEye.fbo);
+    else
+        glBindFramebuffer(GL_FRAMEBUFFER, m_rightEye.fbo);
+}
+
+void EngineGL33Stereo3D::UnbindEyeTarget()
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// ============================================================
+// Public Interface Functions
+// ============================================================
+
+void EngineGL33Stereo3D::BeginFrame()
+{
+    if (!m_enabled || !m_initialized)
+        return;
+    
+    m_frameActive = true;
+    m_currentEye = 0;
+}
+
+void EngineGL33Stereo3D::EndFrame()
+{
+    if (!m_enabled || !m_initialized)
+        return;
+    
+    m_frameActive = false;
+}
+
+void EngineGL33Stereo3D::ResizeRenderTargets(int width, int height)
+{
+    if (!m_initialized)
+        return;
+    
+    // Store new dimensions
+    m_leftEye.width = width;
+    m_leftEye.height = height;
+    m_rightEye.width = width;
+    m_rightEye.height = height;
+    m_compositeTarget.width = width;
+    m_compositeTarget.height = height;
+    
+    // Recreate render targets
+    DestroyRenderTargets();
+    InitializeRenderTargets();
+    
+    LOG_INFO(Graphics, "Stereo3D: Resized render targets to {}x{}", width, height);
+}
+
+void EngineGL33Stereo3D::DrawStereoTestPattern()
+{
+    // Draw a simple 3D test pattern that shows the stereo effect
+    // This is a placeholder that draws colored boxes at different depths
+    
+    // We'll draw a red box in the foreground and a blue box in the background
+    // In a real implementation, this would be replaced with the actual scene rendering
+    
+    // For testing, just clear with different colors for each eye
+    float color[4];
+    if (m_currentEye == 0)
+        color[0] = 0.2f; // Left eye slightly tinted
+    else
+        color[0] = 0.0f;
+    
+    color[1] = 0.2f;
+    color[2] = m_currentEye == 0 ? 0.0f : 0.2f;
+    color[3] = 1.0f;
+    
+    glClearBufferfv(GL_COLOR, 0, color);
+    
+    // Draw a simple geometric shape to show depth
+    // This would be replaced with actual scene geometry
+}
+
+void EngineGL33Stereo3D::DrawDebugOverlay()
+{
+    if (!m_enabled)
+        return;
+    
+    // Would use ImGui for debug display
+    LOG_DEBUG(Graphics, "Stereo3D: Mode={}, Sep={:.3f}, Conv={:.1f}, Scale={:.2f}",
+              (int)m_mode, m_params.eyeSeparation, 
+              m_params.convergenceDistance, m_params.depthScale);
+}
