@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Configuration
+LOGO_URL="https://cdn.gitgpt.chat/rtx/images/mumble-voip-logo.png"
 REPO_URL="https://github.com/igiteam/openofp"
 YOUR_GITHUB_USERNAME="igiteam"
 NEW_REPO_NAME="openofp"

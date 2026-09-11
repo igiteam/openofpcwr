@@ -1,0 +1,47 @@
+There is no ready-made converter for taking IGI terrain files and turning them directly into Operation Flashpoint WRP files. The two games use completely different terrain systems, and no tool has been built to bridge them.
+Why This Doesn't Exist Yet
+
+The fundamental problem is that IGI and Operation Flashpoint represent terrain in incompatible ways.
+
+IGI Terrain:
+Your Brief explains that IGI uses a fractal octree system. The terrain is stored as .ctr (octree), .cmd (cube mesh), .hmp (height map), and .lmp (light map) files. The root cube is huge (2^31 units), and the engine recursively subdivides it based on a Level-of-Detail algorithm. It does not use a simple fixed-size heightmap grid.
+
+OFP Terrain (WRP):
+Operation Flashpoint uses .wrp files, which are structured as a fixed grid of 256x256 cells. Each cell represents a 50-meter square, giving a total map size of 12.8km x 12.8km. The elevation data is stored as integers in centimeters, and textures are referenced by a 512-entry index table.
+The Conversion Challenge
+
+Even if you extracted the raw height data from IGI's .hmp files, you would face these problems:
+
+    Scale Mismatch: IGI uses 4096 world units per meter, while OFP uses a fixed 50-meter grid. The vast IGI terrain (128K x 128K units) would need to be cropped or downsampled drastically to fit OFP's 12.8km limit.
+
+    Coordinate System: IGI uses a right-handed system with Y-forward and Z-up. OFP uses a different convention that would require transformation.
+
+    Texture Mapping: IGI's .bit and .tex files don't map directly to OFP's .paa/.pac texture format.
+
+    Object Placement: IGI stores objects in its octree structure, while OFP uses a separate model list with transform matrices in the WRP file.
+
+What You Could Do Instead
+
+Option 1: Manually Rebuild from Heightmap Data
+
+The IGI Research Data repository contains tools and documentation for extracting IGI level data. You could:
+
+    Extract the .hmp heightmap from IGI levels
+
+    Convert the elevation data to a format WrpTool can import (Wilbur long/lat TXT format)
+
+    Create a new WRP terrain in WrpTool using that heightmap
+
+    Manually place textures and objects to recreate the look
+
+Option 2: Use WrpTool for Manual Terrain Creation
+
+WrpTool is the community standard for creating OFP islands. It can:
+
+    Import heightmaps from external tools
+
+    Place objects and textures manually
+
+    Write WRP files up to 51.2km x 51.2km
+
+You would use it to rebuild the IGI terrain from scratch using extracted height data as a base.
